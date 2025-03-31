@@ -16,6 +16,14 @@ import seaborn as sns
 from ..kernels.glm_kernel import GLMKernel
 from .internal_noise_extractor import InternalNoiseExtractor
 
+import rpy2.robjects as robjects
+import rpy2.robjects.pandas2ri
+from rpy2.robjects.packages import importr
+
+rpy2.robjects.pandas2ri.activate()
+stats = importr('stats')  # Load the 'stats' package (contains glm) 
+base = importr('base')  # Load the 'base' package
+
 from abc import ABC,abstractmethod
 
 class GLMMethod(InternalNoiseExtractor):
@@ -27,7 +35,7 @@ class GLMMethod(InternalNoiseExtractor):
         return "GLM Method"
 
     @classmethod
-    def build_model(cls, glm_model_file='./glm_model.pkl', plot=False):
+    def build_model(cls, glm_model_file='./glm_model.pkl',agg_mode = 'argmax', plot=False):
         """
         Fits an OLS regression model to map `norm_max_feature_ci` to `internal_noise_std`.
 
@@ -48,7 +56,8 @@ class GLMMethod(InternalNoiseExtractor):
                      'n_features': [5],
                      'external_noise_std': [100]}
 
-        analyser_params = {}        
+        analyser_params = {'agg_mode': [agg_mode]}        
+     
                    
         sim = Sim(SimpleExperiment, experiment_params, 
                  LinearObserver, observer_params,
@@ -64,26 +73,56 @@ class GLMMethod(InternalNoiseExtractor):
         if plot: 
             sns.lmplot(x='confidence_interval', y='internal_noise_std', hue='n_trials', data=sim_df)
 
+        glm_model_file = f'./glm_model_{agg_mode}.pkl'
         model.save(glm_model_file)
         return model
         
     @classmethod
-    def extract_norm_ci_value(cls, data_df, trial_id='trial', stim_id= 'stim', feature_id='feature', value_id='value', response_id='response', **kwargs):
+    def extract_norm_ci_value(cls, data_df, trial_id='trial', stim_id= 'stim', feature_id='feature', value_id='value', response_id='response', agg_mode='argmax', **kwargs):
          # Use GLMKernel to fit GLM and extract kernel and confidence intervals
-        
+        backend = kwargs.get("backend", "python")
+        link_function = kwargs.get("link", "probit")
+        # agg_mode = kwargs.get("agg_mode", "argmax")
+
         model = GLMKernel.train_GLM_from_data(data_df,
             trial_id,stim_id, feature_id, value_id, response_id, **kwargs)
 
         if model is None:
             return np.nan
             
-        # extract conf intervals
-        ci = model.conf_int()
-        ci.columns = ['lower_bound', 'upper_bound']
-        ci_df = ci.iloc[1:]  # Exclude the intercept
-        ci_df = ci_df.reset_index(drop=True)
+        # # extract conf intervals
+        # ci = model.conf_int()
+        # ci.columns = ['lower_bound', 'upper_bound']
+        # ci_df = ci.iloc[1:]  # Exclude the intercept
+        # ci_df = ci_df.reset_index(drop=True)
+        if backend == "rpy2":
+            # ci = stats.confint(model)
+            # ci_df = pd.DataFrame(np.array(ci), columns=['lower_bound', 'upper_bound'])
+            # ci_df = ci_df.iloc[1:].reset_index(drop=True)  # Exclude the intercept
+            coefs = robjects.r['coef'](model)
+            if any(np.isnan(coefs)):  # Ensure model coefficients are valid
+                print("Warning: R model contains NaN coefficients. Returning NaN.")
+                return np.nan
 
-        kernel_df = GLMKernel.convert_model_to_kernel(model)
+            try:
+                ci = stats.confint(model)
+                ci_array = np.array(ci)
+        
+                if ci_array.shape[0] < 2 or np.isnan(ci_array).any():  # Ensure valid values
+                    # print("Warning: Not enough valid confidence interval values in R. Returning NaN.")
+                    return np.nan
+
+                ci_df = pd.DataFrame(ci_array, columns=['lower_bound', 'upper_bound'])
+                ci_df = ci_df.iloc[1:].reset_index(drop=True)  # Exclude the intercept
+            except Exception as e:
+                # print(f"Error computing confidence intervals in R: {e}")
+                return np.nan
+        else:
+            ci = model.conf_int()
+            ci.columns = ['lower_bound', 'upper_bound']
+            ci_df = ci.iloc[1:].reset_index(drop=True)  # Exclude the intercept
+
+        kernel_df = GLMKernel.convert_model_to_kernel(model, backend=backend)
 
         # Calculate confidence interval size
         kernel_df['conf_int'] = ci_df['upper_bound'] - ci_df['lower_bound']
@@ -91,17 +130,36 @@ class GLMMethod(InternalNoiseExtractor):
         # Normalize confidence intervals
         kernel_df['norm_ci'] = kernel_df['conf_int'] / kernel_df['kernel_value'].abs()
 
+        if agg_mode == "min":
+            agg_norm_ci = kernel_df['norm_ci'].min()
+        elif agg_mode == "mean":
+            agg_norm_ci = kernel_df['norm_ci'].mean()
+        elif agg_mode == "median":
+            agg_norm_ci = kernel_df['norm_ci'].median()
+        elif agg_mode == "max":
+            agg_norm_ci = kernel_df['norm_ci'].max()
+        elif agg_mode == "argmedian" or agg_mode == "argmean":
+            agg_norm_ci = kernel_df['norm_ci'].iloc[cls.argmedian(list(kernel_df['kernel_value'].abs()))]
+        elif agg_mode == "argmin":
+            agg_norm_ci = kernel_df['norm_ci'].iloc[np.argmin(list(kernel_df['kernel_value'].abs()))]
+        elif agg_mode == "argmax":
+            agg_norm_ci = kernel_df['norm_ci'].iloc[np.argmax(list(kernel_df['kernel_value'].abs()))]
+        else:
+            raise ValueError(f"Unknown aggregation mode: {agg_mode}")
+
         # Calculate normalized maximum feature confidence interval
-        max_feature_ci = kernel_df['norm_ci'].iloc[np.argmax(kernel_df['kernel_value'].abs())]
+        # max_feature_ci = kernel_df['norm_ci'].iloc[np.argmax(kernel_df['kernel_value'].abs())]
         
         # scale by nb of trials
-        norm_max_feature_ci = max_feature_ci * np.sqrt(data_df[trial_id].nunique()) 
+        norm_max_feature_ci = agg_norm_ci * np.sqrt(data_df[trial_id].nunique()) 
         
         return norm_max_feature_ci
-        
+    @classmethod
+    def argmedian(cls, x):
+        return np.argpartition(x, len(x) // 2)[len(x) // 2]  
     
     @classmethod
-    def extract_single_internal_noise(cls, data_df, trial_id='trial', stim_id ='stim', feature_id='feature', value_id='value', response_id='response', **kwargs):
+    def extract_single_internal_noise(cls, data_df, trial_id='trial', stim_id ='stim', feature_id='feature', value_id='value', response_id='response', agg_mode='argmax',**kwargs):
         """
         Extracts internal noise for a single observer/session using the GLM fit.
 
@@ -117,27 +175,30 @@ class GLMMethod(InternalNoiseExtractor):
         """
         if 'glm_model_file' not in kwargs:
             raise ValueError('no model file provided for GLM Method. Use GLMMethod.build_model() before calling') 
-
-        # extract CI on weights from a GLM fit 
-        norm_max_feature_ci=cls.extract_norm_ci_value(data_df, trial_id, stim_id, feature_id, value_id, response_id, **kwargs)
+        
     
-        if np.isnan(norm_max_feature_ci):
+        # extract CI on weights from a GLM fit 
+        norm_max_feature_ci=cls.extract_norm_ci_value(data_df, trial_id, stim_id, feature_id, value_id, response_id, agg_mode,**kwargs)
+    
+        if np.isnan(norm_max_feature_ci)or norm_max_feature_ci < 0:
+            # print(f"Warning: Invalid norm_max_feature_ci value ({norm_max_feature_ci}). Returning NaN.")
             return np.nan
 
         # convert to internal noise 
-        model_file = kwargs['glm_model_file']
+        model_file = f'./glm_model_{agg_mode}.pkl'
         if not os.path.isfile(model_file): 
-            raise ValueError('unvalid model file provided for GLM Method') 
-        else: 
-            model = sm.load(model_file)
-            ci_df = pd.DataFrame({'confidence_interval': [norm_max_feature_ci], 
-                'n_trials': [data_df[trial_id].nunique()],})
-            ci_df = sm.add_constant(ci_df)
-            internal_noise = model.predict(ci_df).iloc[0]
+            raise ValueError(f"Invalid model file {model_file}. Run `build_model(agg_mode='{agg_mode}')` first.") 
+
+       
+        model = sm.load(model_file)
+        ci_df = pd.DataFrame({'confidence_interval': [norm_max_feature_ci], 'n_trials': [data_df[trial_id].nunique()],})
+        ci_df = sm.add_constant(ci_df)
+        internal_noise = model.predict(ci_df).iloc[0]
 
             # note: to get confidence intervals on estimated noise, do: 
             # pred = model.get_prediction(ci_df)
-            # pred.summary_frame(alpha=0.05) 
+            # print(f"Backend: {backend}, Norm Max CI: {norm_max_feature_ci}, Predicted Internal Noise: {internal_noise}")
+
         return internal_noise
 
     
